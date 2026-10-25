@@ -125,6 +125,145 @@ from .utils import (
 )
 
 
+def _mis_default_split_chunks(q_len, kv_len):
+    """Cheap necessary geometry checks using already available host scalars."""
+    if not 3456 < q_len <= 4096 or kv_len < q_len + 8192:
+        return 0
+    query_tiles = (q_len + 127) // 128
+    chunks = (kv_len + 2047) // 2048
+    return chunks if query_tiles * 4 * chunks <= 864 else 0
+
+
+def _single_mis_metadata_to_host(wrapper, qo_indptr, kv_indptr, last_page_len):
+    """Stage B1 int32 metadata with one synchronization, reading fresh values."""
+    if (
+        qo_indptr.is_cuda
+        and qo_indptr.device
+        == kv_indptr.device
+        == last_page_len.device
+        == wrapper.device
+    ):
+        buffers = getattr(wrapper, "_mis_host_metadata", None)
+        if buffers is None:
+            storage = torch.empty(5, dtype=torch.int32, device="cpu", pin_memory=True)
+            buffers = (storage[:2], storage[2:4], storage[4:])
+            wrapper._mis_host_metadata = buffers
+        buffers[0].copy_(qo_indptr, non_blocking=True)
+        buffers[1].copy_(kv_indptr, non_blocking=True)
+        buffers[2].copy_(last_page_len, non_blocking=True)
+        # CPU consumption must wait for all three D2H copies on this stream.
+        torch.cuda.current_stream(wrapper.device).synchronize()
+        return buffers
+    return qo_indptr.cpu(), kv_indptr.cpu(), last_page_len.cpu()
+
+
+def _select_mis_default_split_size(
+    wrapper,
+    *,
+    fixed_split_size,
+    disable_split_kv,
+    prefix_len_ptr,
+    qo_indptr_host,
+    kv_lens_arr_host,
+    index_dtype,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    page_size,
+    q_data_type,
+    kv_data_type,
+    o_data_type,
+    pos_encoding_mode,
+    use_fp16_qk_reduction,
+    window_left,
+    logits_soft_cap,
+    check_workspace=True,
+    q_len=None,
+    kv_len=None,
+    device_supported=None,
+):
+    """Bounded SM80 MIS policy; preserve the caller's split size on fallback.
+
+    A long shared prefix can leave the ordinary two-CTA-per-SM split budget
+    unable to split a partly occupied grid. 2048-token chunks expose more
+    parallelism while amortizing the partial-state merge. Keep the policy
+    within the measured kernel/resource region, and leave graph capacities
+    and explicit caller choices to the existing planner.
+    """
+    if (
+        prefix_len_ptr is None
+        or wrapper.is_cuda_graph_enabled
+        or wrapper._jit_module is not None
+        or wrapper._kv_layout != "NHD"
+        or fixed_split_size > 0
+        or disable_split_kv
+        or num_qo_heads != 4
+        or num_kv_heads != 4
+        or head_dim_qk != 128
+        or head_dim_vo != 128
+        or page_size != 16
+        or q_data_type not in (torch.float16, torch.bfloat16)
+        or kv_data_type != q_data_type
+        or o_data_type != q_data_type
+        or pos_encoding_mode != "NONE"
+        or use_fp16_qk_reduction
+        or window_left != -1
+        or logits_soft_cap != 0.0
+        or index_dtype != torch.int32
+        or qo_indptr_host.dtype != torch.int32
+        or qo_indptr_host.numel() != 2
+        or kv_lens_arr_host.numel() != 1
+    ):
+        return fixed_split_size
+    # These tensors are already on CPU. Read their values without creating
+    # temporary indexed/subtracted tensors on every plan call.
+    if q_len is None:
+        q_start, q_end = qo_indptr_host.tolist()
+        q_len = q_end - q_start
+    if kv_len is None:
+        kv_len = kv_lens_arr_host.tolist()[0]
+    # D128/GQA1 uses CTA_TILE_Q=128 here. Shorter prefixes did not improve
+    # completed plan+run measurements.
+    chunks = _mis_default_split_chunks(q_len, kv_len)
+    if not chunks:
+        return fixed_split_size
+    if device_supported is None:
+        device_supported = (
+            get_compute_capability(wrapper.device) == (8, 0)
+            and get_device_sm_count(wrapper.device) == 108
+        )
+    if not device_supported:
+        return fixed_split_size
+    # The planner reserves FP32 partial V/S for whole query tiles, even
+    # with FP16/BF16 output and a partial final query tile.
+    query_tiles = (q_len + 127) // 128
+    partial_rows = query_tiles * 128 * chunks
+    partial_bytes = partial_rows * num_qo_heads * (head_dim_vo * 4 + 4)
+    if check_workspace:
+        if partial_bytes > (
+            wrapper._float_workspace_buffer.numel()
+            * wrapper._float_workspace_buffer.element_size()
+        ):
+            return fixed_split_size
+        # Match the six allocations in PrefillPlanImpl, including alignment.
+        tile_index_bytes = query_tiles * chunks * 4
+        # Three aligned tile arrays, two scalars, then the output indptr.
+        aligned_tile_bytes = (tile_index_bytes + 15) // 16 * 16
+        int_bytes = 3 * aligned_tile_bytes + 16 + (q_len + 1) * 4
+        if int_bytes > (
+            wrapper._int_workspace_buffer.numel()
+            * wrapper._int_workspace_buffer.element_size()
+        ):
+            return fixed_split_size
+    # Only this narrow candidate region reads MIS device metadata: one
+    # scalar transfer at plan time, never a transfer in run().
+    prefix_len = int(prefix_len_ptr.item())
+    if prefix_len < max(q_len, 8192):
+        return fixed_split_size
+    return 2048 // page_size
+
+
 def _cudnn_identity_scales(q, k, v, q_scale, k_scale, v_scale):
     # Python unit scales carry no run-time state. Tensor scales may change after
     # capture, and FP8 must retain its explicit scale bindings even for 1.0.
@@ -3113,6 +3252,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             pin_memory=True,
         )
 
+    @functools.cached_property
+    def _mis_default_split_supported(self) -> bool:
+        # The wrapper's device is fixed. Avoid repeated metadata extraction
+        # and selector kwargs on architectures outside the measured region.
+        return (
+            get_compute_capability(self.device) == (8, 0)
+            and get_device_sm_count(self.device) == 108
+        )
+
     @flashinfer_api
     def workspace_size(
         self,
@@ -3264,7 +3412,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             block_tables,
             max_item_len_ptr,
             max_token_per_sequence,
-            prefix_len_ptr,
             rope_scale,
             rope_theta,
             seq_lens_q,
@@ -3378,6 +3525,38 @@ class BatchPrefillWithPagedKVCacheWrapper:
             window_left,
         ]
         if backend == "fa2":
+            if (
+                prefix_len_ptr is not None
+                and seq_lens is None
+                and not self.is_cuda_graph_enabled
+                and fixed_split_size <= 0
+                and not disable_split_kv
+                and batch_size == 1
+                and 3456 < total_num_rows <= 4096
+                and self._mis_default_split_supported
+            ):
+                fixed_split_size = _select_mis_default_split_size(
+                    self,
+                    fixed_split_size=fixed_split_size,
+                    disable_split_kv=disable_split_kv,
+                    prefix_len_ptr=prefix_len_ptr,
+                    qo_indptr_host=qo_indptr_host,
+                    kv_lens_arr_host=kv_lens_arr_host,
+                    index_dtype=paged_kv_indptr.dtype,
+                    num_qo_heads=num_qo_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
+                    page_size=page_size,
+                    q_data_type=q_data_type,
+                    kv_data_type=kv_data_type,
+                    o_data_type=o_data_type,
+                    pos_encoding_mode=pos_encoding_mode,
+                    use_fp16_qk_reduction=use_fp16_qk_reduction,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    check_workspace=False,
+                )
             args.append(fixed_split_size)
             args.append(disable_split_kv)
             args.append(0)  # num_colocated_ctas
@@ -3572,6 +3751,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
 
+        FA2 may choose an automatic split for long-prefix multi-item scoring
+        on supported SM80 shapes when ``fixed_split_size`` is unset. Explicit
+        positive split sizes and ``disable_split_kv`` take precedence. CUDA-graph
+        wrappers retain the generic policy. :meth:`workspace_size` includes the
+        preferred MIS plan; if the supplied buffers cannot hold that plan,
+        :meth:`plan` falls back to the generic policy.
+
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
         _check_workspace_buffer_alignment(
@@ -3691,12 +3877,37 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._token_pos_in_items_len = token_pos_in_items_len
         self._max_item_len_ptr = max_item_len_ptr
 
-        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
-        self._qo_indptr_last = int(qo_indptr_host[-1])
+        # B1 MIS has scalar lengths: avoid allocating temporary CPU tensors
+        # for slices, differences and reductions. Re-read values on every plan.
+        single_mis = (
+            prefix_len_ptr is not None
+            and batch_size == 1
+            and self._backend in ("auto", "fa2")
+            and not self.is_cuda_graph_enabled
+            and qo_indptr.dtype
+            == paged_kv_indptr.dtype
+            == paged_kv_last_page_len.dtype
+            == torch.int32
+        )
+        if single_mis:
+            qo_indptr_host, paged_kv_indptr_host, paged_kv_last_page_len_host = (
+                _single_mis_metadata_to_host(
+                    self, qo_indptr, paged_kv_indptr, paged_kv_last_page_len
+                )
+            )
+        else:
+            qo_indptr_host = qo_indptr.to("cpu")
+        if single_mis:
+            q_start, q_end = qo_indptr_host.tolist()
+            self._qo_indptr_last = q_end
+            mis_q_len = q_end - q_start
+        else:
+            self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
         if max_token_per_sequence is not None:
             self._max_q_len = max_token_per_sequence
+        elif single_mis:
+            self._max_q_len = mis_q_len
         else:
             self._max_q_len = (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
 
@@ -3705,9 +3916,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # Non-cuDNN planners still consume host page metadata even when the
         # caller supplies a maximum. Keep cuDNN's device-length fast path.
         if max_sequence_kv is None or self._backend != "cudnn":
-            paged_kv_indptr_host = paged_kv_indptr.to("cpu")
-            paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
-            if seq_lens is None:
+            if not single_mis:
+                paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+                paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
+            if single_mis and seq_lens is None:
+                page_start, page_end = paged_kv_indptr_host.tolist()
+                mis_kv_len = (
+                    max(page_end - page_start - 1, 0) * page_size
+                    + paged_kv_last_page_len_host.tolist()[0]
+                )
+                kv_lens_arr_host = torch.tensor(
+                    [mis_kv_len], dtype=torch.int32, device="cpu"
+                )
+            elif seq_lens is None:
                 kv_lens_arr_host = get_seq_lens(
                     paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
                 )
@@ -3722,7 +3943,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 kv_lens_arr_host, non_blocking=non_blocking
             )
             if max_sequence_kv is None:
-                self._max_kv_len = kv_lens_arr_host.max().item()
+                self._max_kv_len = (
+                    mis_kv_len
+                    if single_mis and seq_lens is None
+                    else kv_lens_arr_host.max().item()
+                )
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
@@ -3992,6 +4217,59 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 window_left,
             ]
             if self._backend == "fa2":
+                if (
+                    3456 < total_num_rows <= 4096
+                    and self._prefix_len_ptr is not None
+                    and seq_lens is None
+                    and not self.is_cuda_graph_enabled
+                    and fixed_split_size <= 0
+                    and not disable_split_kv
+                    and batch_size == 1
+                    and num_qo_heads == num_kv_heads == 4
+                    and self._kv_layout == "NHD"
+                    and self._mis_default_split_supported
+                    and (
+                        max_sequence_kv is not None
+                        or (
+                            (
+                                mis_chunks := _mis_default_split_chunks(
+                                    total_num_rows, self._max_kv_len
+                                )
+                            )
+                            and self._float_workspace_buffer.numel()
+                            * self._float_workspace_buffer.element_size()
+                            >= ((total_num_rows + 127) // 128)
+                            * 128
+                            * mis_chunks
+                            * 4
+                            * (128 * 4 + 4)
+                        )
+                    )
+                ):
+                    fixed_split_size = _select_mis_default_split_size(
+                        self,
+                        fixed_split_size=fixed_split_size,
+                        disable_split_kv=disable_split_kv,
+                        prefix_len_ptr=prefix_len_ptr,
+                        qo_indptr_host=qo_indptr_host,
+                        kv_lens_arr_host=kv_lens_arr_host,
+                        index_dtype=paged_kv_indptr.dtype,
+                        num_qo_heads=num_qo_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_dim_qk=head_dim_qk,
+                        head_dim_vo=head_dim_vo,
+                        page_size=page_size,
+                        q_data_type=q_data_type,
+                        kv_data_type=kv_data_type,
+                        o_data_type=o_data_type,
+                        pos_encoding_mode=pos_encoding_mode,
+                        use_fp16_qk_reduction=use_fp16_qk_reduction,
+                        window_left=window_left,
+                        logits_soft_cap=logits_soft_cap,
+                        q_len=mis_q_len if single_mis else None,
+                        kv_len=mis_kv_len if single_mis else None,
+                        device_supported=True,
+                    )
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
                     kv_data_type, self.device
